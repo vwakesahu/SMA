@@ -1,281 +1,210 @@
 import asyncio
 import json
-import datetime
+import os
+from datetime import datetime
+from pymongo import MongoClient
 import matplotlib.pyplot as plt
 import seaborn as sns
-import pandas as pd
-import numpy as np
 from twikit import Client
-from pymongo import MongoClient
 
-# Set style for visualizations
-sns.set_style("whitegrid")
-plt.rcParams['figure.figsize'] = (12, 8)
+# MongoDB connection
+MONGO_URI = "mongodb+srv://userone:userone@cluster0.dni41vz.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+DB_NAME = "twitter_data"
+COLLECTION_NAME = "tweets"
 
-# MongoDB setup
-def get_mongo_client():
-    """Connect to MongoDB - update connection string as needed"""
-    # Default connection to localhost MongoDB
-    return MongoClient("mongodb+srv://userone:userone@cluster0.dni41vz.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
-
-async def scrape_and_visualize_data(usernames):
+async def scrape_tweets(username, count=5):
+    """Scrape tweets from a specific user"""
     client = Client()
-
+    
     await client.login(
         auth_info_1="meowdev88",
         auth_info_2="gauradashari@gmail.com",
         password="meowdev03"
     )
+    
+    # Get user
+    user = await client.get_user_by_screen_name(username)
+    
+    # Get tweets
+    tweets = await user.get_tweets("Tweets", count=count)
+    
+    # Store tweet data
+    data = []
+    
+    for tweet in tweets:
+        tweet_data = {
+            "username": username,
+            "text": tweet.text,
+            "created_at": tweet.created_at,
+            "likes": tweet.favorite_count,
+            "retweets": tweet.retweet_count,
+            "replies": tweet.reply_count,
+            "quotes": tweet.quote_count,
+            "bookmarks": tweet.bookmark_count,
+            "views": tweet.view_count,
+            "scraped_at": datetime.now().isoformat()
+        }
+        data.append(tweet_data)
+    
+    return data
 
-    # Setup MongoDB
-    mongo_client = get_mongo_client()
-    db = mongo_client["twitter_analytics"]
-    tweets_collection = db["tweets"]
+def store_in_mongodb(data):
+    """Store tweet data in MongoDB"""
+    client = MongoClient(MONGO_URI)
+    db = client[DB_NAME]
+    collection = db[COLLECTION_NAME]
     
-    all_users_data = {}
-    all_tweets_df = pd.DataFrame()
+    # Insert data
+    result = collection.insert_many(data)
+    
+    print(f"✅ Stored {len(result.inserted_ids)} tweets in MongoDB")
+    return len(result.inserted_ids)
 
-    # Scrape data for each username
-    for username in usernames:
-        try:
-            print(f"Fetching data for user: {username}")
-            user = await client.get_user_by_screen_name(username)
-            tweets = await user.get_tweets("Tweets", count=20)
-            
-            data = []
-            for tweet in tweets:
-                # Get tweet data
-                tweet_data = {
-                    "tweet_id": tweet.id,  # Using id instead of id_str
-                    "username": username,
-                    "text": tweet.text,
-                    "created_at": tweet.created_at,
-                    "likes": tweet.favorite_count,
-                    "retweets": tweet.retweet_count,
-                    "replies": tweet.reply_count,
-                    "quotes": tweet.quote_count,
-                    "bookmarks": tweet.bookmark_count,
-                    "views": tweet.view_count,
-                    "timestamp": datetime.datetime.now()  # Add timestamp for when we collected this
-                }
-                data.append(tweet_data)
-                
-                # Save to MongoDB
-                tweets_collection.update_one(
-                    {"tweet_id": tweet.id, "username": username},
-                    {"$set": tweet_data},
-                    upsert=True
-                )
-            
-            all_users_data[username] = data
-            
-            # Save individual user data to JSON as backup
-            with open(f"{username}_tweets.json", "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            
-            print(f"✅ Saved {len(data)} tweets to MongoDB and {username}_tweets.json")
-            
-            # Convert to DataFrame and append
-            user_df = pd.DataFrame(data)
-            all_tweets_df = pd.concat([all_tweets_df, user_df])
-        
-        except Exception as e:
-            print(f"Error fetching data for {username}: {e}")
+def retrieve_from_mongodb(username):
+    """Retrieve tweets for a specific user from MongoDB"""
+    client = MongoClient(MONGO_URI)
+    db = client[DB_NAME]
+    collection = db[COLLECTION_NAME]
     
-    # Save combined data to MongoDB collection
-    print(f"✅ Saved combined data for {len(all_users_data)} users to MongoDB")
+    # Query data
+    cursor = collection.find({"username": username}, {"_id": 0})
     
-    # Create visualizations
-    create_visualizations(all_tweets_df, all_users_data)
+    # Process and validate data before returning
+    tweets = []
+    for doc in cursor:
+        # Ensure all required fields exist and have valid values
+        processed_doc = {
+            "username": doc.get("username", username),
+            "text": doc.get("text", ""),
+            "created_at": doc.get("created_at", ""),
+            "likes": int(doc.get("likes", 0) or 0),  # Convert to int, default to 0 if None or falsy
+            "retweets": int(doc.get("retweets", 0) or 0),
+            "replies": int(doc.get("replies", 0) or 0),
+            "quotes": int(doc.get("quotes", 0) or 0),
+            "bookmarks": int(doc.get("bookmarks", 0) or 0),
+            "views": int(doc.get("views", 0) or 0),
+            "scraped_at": doc.get("scraped_at", "")
+        }
+        tweets.append(processed_doc)
     
-    return all_users_data
+    print(f"📊 Retrieved {len(tweets)} tweets from MongoDB for user {username}")
+    return tweets
 
-def create_visualizations(df, all_users_data):
-    if df.empty:
-        print("No data available for visualization.")
+def create_visualizations(tweets, username):
+    """Create visualizations from tweet data"""
+    if not tweets:
+        print("No tweets to visualize")
         return
     
-    # Try to convert created_at to datetime with error handling
-    try:
-        df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce')
-    except Exception as e:
-        print(f"Warning: Could not convert created_at to datetime: {e}")
-        # Create a dummy date column if conversion fails
-        df['created_at'] = pd.to_datetime('today')
+    # Create output directory if it doesn't exist
+    os.makedirs("visualizations", exist_ok=True)
     
-    # Ensure numeric types for metrics columns
-    metrics = ['likes', 'retweets', 'replies', 'quotes', 'bookmarks', 'views']
+    # Filter out tweets with missing data and convert types
+    valid_tweets = []
+    for tweet in tweets:
+        if (tweet.get("created_at") and 
+            tweet.get("likes") is not None and 
+            tweet.get("retweets") is not None and 
+            tweet.get("views") is not None):
+            valid_tweets.append(tweet)
     
-    for metric in metrics:
-        try:
-            df[metric] = pd.to_numeric(df[metric], errors='coerce')
-        except Exception as e:
-            print(f"Warning: Could not convert {metric} to numeric: {e}")
-            df[metric] = 0
-    
-    # Now create visualizations with the cleaned data
-    
-    # 1. Engagement metrics comparison across users
-    plt.figure(figsize=(14, 10))
-    
-    # Calculate average metrics per user with error handling
-    avg_metrics_list = []
-    
-    for username in df['username'].unique():
-        user_metrics = {'username': username}
-        user_df = df[df['username'] == username]
+    if not valid_tweets:
+        print("No valid tweet data available for visualization")
+        return
         
-        for metric in metrics:
-            try:
-                user_metrics[metric] = user_df[metric].mean()
-            except Exception:
-                user_metrics[metric] = 0
-        
-        avg_metrics_list.append(user_metrics)
+    # Sort tweets by date
+    valid_tweets = sorted(valid_tweets, key=lambda x: x["created_at"])
     
-    avg_metrics = pd.DataFrame(avg_metrics_list)
+    # Prepare data for plotting
+    dates = [str(i+1) for i in range(len(valid_tweets))]  # Use sequential numbers instead of dates
+    tweet_dates = [tweet["created_at"].split("T")[0] if isinstance(tweet["created_at"], str) else str(tweet["created_at"]) for tweet in valid_tweets]
+    likes = [int(tweet["likes"]) if not isinstance(tweet["likes"], int) else tweet["likes"] for tweet in valid_tweets]
+    retweets = [int(tweet["retweets"]) if not isinstance(tweet["retweets"], int) else tweet["retweets"] for tweet in valid_tweets]
+    views = [int(tweet["views"]) if not isinstance(tweet["views"], int) else tweet["views"] for tweet in valid_tweets]
     
-    # Create subplots for each metric
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    axes = axes.flatten()
+    # Set style
+    sns.set(style="whitegrid")
     
-    for i, metric in enumerate(metrics):
-        try:
-            sns.barplot(x='username', y=metric, data=avg_metrics, ax=axes[i], palette='viridis')
-            axes[i].set_title(f'Average {metric.capitalize()} per Tweet')
-            axes[i].set_xlabel('Username')
-            axes[i].set_ylabel(metric.capitalize())
-            axes[i].tick_params(axis='x', rotation=45)
-        except Exception as e:
-            print(f"Warning: Could not create barplot for {metric}: {e}")
-            axes[i].text(0.5, 0.5, f"Could not visualize {metric}", 
-                      horizontalalignment='center', verticalalignment='center')
+    # Plot 1: Engagement metrics comparison
+    plt.figure(figsize=(12, 6))
+    plt.plot(dates, likes, marker='o', linewidth=2, label='Likes')
+    plt.plot(dates, retweets, marker='s', linewidth=2, label='Retweets')
+    plt.title(f'Engagement Metrics for @{username}')
+    plt.xlabel('Tweet Number')
+    plt.ylabel('Count')
+    
+    # Add a second x-axis with actual dates
+    ax2 = plt.twiny()
+    ax2.set_xlim(plt.gca().get_xlim())
+    ax2.set_xticks(range(len(tweet_dates)))
+    ax2.set_xticklabels(tweet_dates, rotation=45, ha='left')
+    
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"visualizations/{username}_engagement.png")
+    plt.close()
+    
+    # Plot 2: Views
+    plt.figure(figsize=(12, 6))
+    plt.bar(dates, views, color='skyblue')
+    plt.title(f'Tweet Views for @{username}')
+    plt.xlabel('Tweet Number')
+    plt.ylabel('Views')
+    
+    # Add a second x-axis with actual dates
+    ax2 = plt.twiny()
+    ax2.set_xlim(plt.gca().get_xlim())
+    ax2.set_xticks(range(len(tweet_dates)))
+    ax2.set_xticklabels(tweet_dates, rotation=45, ha='left')
     
     plt.tight_layout()
-    plt.savefig('user_engagement_comparison.png')
-    print("✅ Saved user engagement comparison chart to user_engagement_comparison.png")
-
-    # 2. Total engagement metrics per user (pie chart)
-    try:
-        plt.figure(figsize=(12, 12))
-        total_engagement = df.groupby('username')[['likes', 'retweets', 'replies']].sum()
-        total_engagement_per_user = total_engagement.sum(axis=1)
-        
-        if total_engagement_per_user.sum() > 0:
-            plt.pie(total_engagement_per_user, labels=total_engagement_per_user.index, autopct='%1.1f%%', 
-                    shadow=True, startangle=90, colors=sns.color_palette('viridis', len(total_engagement_per_user)))
-            plt.axis('equal')
-            plt.title('Total Engagement Share by User (Likes + Retweets + Replies)')
-            plt.savefig('total_engagement_share.png')
-            print("✅ Saved total engagement share chart to total_engagement_share.png")
-        else:
-            print("Warning: No valid engagement data for pie chart")
-    except Exception as e:
-        print(f"Warning: Could not create pie chart: {e}")
-
-    # 3. Timeline of likes for each user
-    try:
-        plt.figure(figsize=(14, 8))
-        for username in df['username'].unique():
-            user_df = df[df['username'] == username].sort_values('created_at')
-            if not user_df.empty and not user_df['created_at'].isna().all():
-                plt.plot(user_df['created_at'], user_df['likes'], 'o-', label=username)
-        
-        plt.title('Likes Timeline by User')
-        plt.xlabel('Tweet Date')
-        plt.ylabel('Number of Likes')
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig('likes_timeline.png')
-        print("✅ Saved likes timeline chart to likes_timeline.png")
-    except Exception as e:
-        print(f"Warning: Could not create likes timeline: {e}")
-
-    # 4. Views vs Engagement scatter plot
-    try:
-        plt.figure(figsize=(14, 8))
-        
-        # Ensure views are not zero to avoid division by zero
-        df['views_safe'] = df['views'].replace(0, np.nan)
-        df['engagement_ratio'] = (df['likes'] + df['retweets'] + df['replies']) / df['views_safe']
-        
-        scatter = sns.scatterplot(x='views', y='likes', 
-                                hue='username', size='retweets',
-                                sizes=(50, 400), data=df, alpha=0.7)
-        
-        plt.title('Views vs Likes Relationship (Size = Retweets)')
-        plt.xlabel('Views')
-        plt.ylabel('Likes')
-        plt.grid(True)
-        plt.savefig('views_vs_likes.png')
-        print("✅ Saved views vs likes scatter plot to views_vs_likes.png")
-    except Exception as e:
-        print(f"Warning: Could not create scatter plot: {e}")
+    plt.savefig(f"visualizations/{username}_views.png")
+    plt.close()
     
-    # 5. Correlation heatmap of metrics
-    try:
-        plt.figure(figsize=(10, 8))
-        correlation = df[metrics].corr()
-        sns.heatmap(correlation, annot=True, cmap='coolwarm', vmin=-1, vmax=1)
-        plt.title('Correlation Between Engagement Metrics')
-        plt.tight_layout()
-        plt.savefig('metrics_correlation.png')
-        print("✅ Saved metrics correlation heatmap to metrics_correlation.png")
-    except Exception as e:
-        print(f"Warning: Could not create correlation heatmap: {e}")
-        
-    # 6. Engagement distribution by user (boxplot)
-    try:
-        plt.figure(figsize=(16, 10))
-        metrics_to_plot = ['likes', 'retweets', 'replies']
-        
-        for i, metric in enumerate(metrics_to_plot):
-            plt.subplot(1, 3, i+1)
-            sns.boxplot(x='username', y=metric, data=df, palette='viridis')
-            plt.title(f'{metric.capitalize()} Distribution')
-            plt.xticks(rotation=45)
-            
-        plt.tight_layout()
-        plt.savefig('engagement_distribution.png')
-        print("✅ Saved engagement distribution boxplot to engagement_distribution.png")
-    except Exception as e:
-        print(f"Warning: Could not create boxplot: {e}")
-
-def load_from_mongodb_and_visualize():
-    """Load data from MongoDB and create visualizations"""
-    mongo_client = get_mongo_client()
-    db = mongo_client["twitter_analytics"]
-    tweets_collection = db["tweets"]
+    # Plot 3: Engagement rate (likes + retweets / views)
+    engagement_rates = [(like + rt) / view if view > 0 else 0 for like, rt, view in zip(likes, retweets, views)]
+    plt.figure(figsize=(12, 6))
+    plt.bar(dates, engagement_rates, color='lightgreen')
+    plt.title(f'Engagement Rate for @{username}')
+    plt.xlabel('Tweet Number')
+    plt.ylabel('Engagement Rate')
     
-    # Retrieve all tweets
-    tweets_cursor = tweets_collection.find({})
-    df = pd.DataFrame(list(tweets_cursor))
+    # Add a second x-axis with actual dates
+    ax2 = plt.twiny()
+    ax2.set_xlim(plt.gca().get_xlim())
+    ax2.set_xticks(range(len(tweet_dates)))
+    ax2.set_xticklabels(tweet_dates, rotation=45, ha='left')
     
-    if df.empty:
-        print("No data found in MongoDB")
-        return
+    plt.tight_layout()
+    plt.savefig(f"visualizations/{username}_engagement_rate.png")
+    plt.close()
     
-    print(f"Found {len(df)} tweets in MongoDB")
-    
-    # Create visualizations
-    create_visualizations(df, None)
+    print(f"✅ Created visualizations in 'visualizations/{username}_*.png'")
 
 async def main():
-    # List of users to scrape
-    usernames = ["vwakesahu", "elonmusk", "BillGates", "sundarpichai"]
+    username = "vwakesahu"  # Target user
+    count = 10  # Number of tweets to scrape
     
-    # Select operation mode
-    mode = 1  # Change to 2 to load from MongoDB without scraping
-    
-    if mode == 1:
-        print("Option 1: Scraping new data, saving to MongoDB, and creating visualizations...")
-        all_user_data = await scrape_and_visualize_data(usernames)
-    else:
-        print("Option 2: Loading from MongoDB and creating visualizations...")
-        load_from_mongodb_and_visualize()
-    
-    print("Data collection and visualization complete!")
+    try:
+        # Step 1: Scrape tweets
+        print(f"🔍 Scraping {count} tweets from @{username}...")
+        tweets = await scrape_tweets(username, count)
+        
+        # Step 2: Store in MongoDB
+        store_in_mongodb(tweets)
+        
+        # Step 3: Retrieve from MongoDB
+        retrieved_tweets = retrieve_from_mongodb(username)
+        
+        # Step 4: Create visualizations
+        create_visualizations(retrieved_tweets, username)
+        
+        print("✅ Process completed successfully!")
+        
+    except Exception as e:
+        print(f"❌ Error occurred: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     asyncio.run(main())
